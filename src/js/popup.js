@@ -10,6 +10,7 @@ const DEFAULT_CONFIG = {
 	mName: '', mId: '', mDegree: '大学', mJob: '专业技术人员', mPhone: '',
  fName: '', fId: '', fDegree: '大学', fJob: '其他从业人员', fPhone: '',
 	notifyValue: '01',
+	confirmDelay: 1000,
 	retryInterval: 800,
 	retryMax: 30,
 };
@@ -69,6 +70,7 @@ const Reserver = {
 			fDegree: find('#cfg-f-degree').value,
 			fJob: find('#cfg-f-job').value,
 			fPhone: find('#cfg-f-phone').value,
+			confirmDelay: parseInt(find('#cfg-confirm-delay').value) || 1000,
 			retryInterval: parseInt(find('#cfg-retry-interval').value) || 800,
 			retryMax: parseInt(find('#cfg-retry-max').value) || 30,
 		};
@@ -97,6 +99,7 @@ const Reserver = {
 			find('#cfg-f-degree').value = cfg.fDegree || '';
 			find('#cfg-f-job').value = cfg.fJob || '';
 			find('#cfg-f-phone').value = cfg.fPhone || '';
+			find('#cfg-confirm-delay').value = cfg.confirmDelay || 1000;
 			find('#cfg-retry-interval').value = cfg.retryInterval || 800;
 			find('#cfg-retry-max').value = cfg.retryMax || 30;
 		});

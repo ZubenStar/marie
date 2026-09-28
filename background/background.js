@@ -1,6 +1,23 @@
 const onMessage = chrome.runtime.onMessage;
 let currentPageInfo = null; // 存储当前页面信息
 
+// 缓存插件开关：原来每次 PAGE_LOAD 都读一次 sync storage，等于每次页面导航都多一跳。
+// enabledReady 保证 Service Worker 冷启动时首次读取完成前不会误判为「关闭」；
+// 之后由 storage.onChanged 维持缓存新鲜度。
+let marieEnabledCache = null;
+const enabledReady = new Promise((resolve) => {
+	chrome.storage.sync.get({ marieEnabled: false }, (data) => {
+		marieEnabledCache = !!data.marieEnabled;
+		resolve();
+	});
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+	if (area === 'sync' && changes.marieEnabled) {
+		marieEnabledCache = !!changes.marieEnabled.newValue;
+	}
+});
+
 // 根据页面URL判断并执行相应的自动化操作
 function handlePageAction(tabId, url) {
 	let action = null;
@@ -48,10 +65,10 @@ onMessage.addListener(function(req, sender, sendResponse){
 				timestamp: Date.now()
 			};
 
-			// 检查插件开关，开启时才自动执行
-			chrome.storage.sync.get({ marieEnabled: false }, (data) => {
-				console.log('[Marie bg] PAGE_LOAD, 开关=', data.marieEnabled, 'URL=', sender.tab.url);
-				if (data.marieEnabled) {
+			// 检查插件开关（内存缓存，冷启动首读由 enabledReady 兜住）
+			enabledReady.then(() => {
+				console.log('[Marie bg] PAGE_LOAD, 开关=', marieEnabledCache, 'URL=', sender.tab.url);
+				if (marieEnabledCache) {
 					handlePageAction(sender.tab.id, sender.tab.url);
 				}
 			});
@@ -71,6 +88,19 @@ onMessage.addListener(function(req, sender, sendResponse){
 			});
 			sendResponse('手动填充指令已发送');
 			break;
+		case 'INJECT_BRIDGE':
+			// 兜底：manifest 的 world:"MAIN" 内容脚本未注入时，补注一次主世界桥。
+			// bridge.js 自带 __marieBridgeInstalled 守卫，重复注入是空操作。
+			chrome.scripting.executeScript({
+				target: { tabId: sender.tab.id },
+				world: 'MAIN',
+				files: ['src/content_scripts/bridge.js']
+			}).then(() => {
+				sendResponse('ok');
+			}).catch(function(err) {
+				sendResponse('error: ' + err.message);
+			});
+			return true;
 		case 'EXEC_IN_PAGE':
 			chrome.scripting.executeScript({
 				target: { tabId: sender.tab.id },

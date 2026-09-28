@@ -43,6 +43,9 @@ const DEFAULT_INFO = {
 
   notifyValue: '01',
 
+  // 点「下一步」前的确认延时(ms)：先等页面回显所选网点/时段，最多等这么久
+  confirmDelay: 1000,
+
   retry: {
     enabled: true,
     interval: 800,
@@ -79,6 +82,7 @@ const configReady = new Promise((resolve) => {
         },
         officeNames: DEFAULT_INFO.officeNames,
         notifyValue: cfg.notifyValue || '01',
+        confirmDelay: cfg.confirmDelay || DEFAULT_INFO.confirmDelay,
         retry: {
           enabled: true,
           interval: cfg.retryInterval || 800,
@@ -98,48 +102,199 @@ const find = (selector) => {
   return el;
 };
 
-// 等待动态加载的元素出现（AJAX 渲染的 radio 等）
-const waitForElement = (selector, timeout = 5000) => {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---- 计时打点：便于量化各阶段耗时（控制台过滤 [Marie][t]） ----
+const T0 = performance.now();
+const mark = (label, extra) => {
+  const dt = Math.round(performance.now() - T0);
+  console.log('[Marie][t] ' + label + ' +' + dt + 'ms' + (extra ? ' ' + extra : ''));
+};
+
+// 等待元素出现并满足条件。用 MutationObserver 替代 100ms 轮询，
+// 检测延迟从平均 ~50ms 降到亚帧级（DOM 变更后在本次任务内即回调）。
+const waitFor = (selector, predicate, timeout = 5000) => {
   return new Promise((resolve) => {
-    const el = document.querySelector(selector);
-    if (el) return resolve(el);
-    const start = Date.now();
-    const check = () => {
-      const el = document.querySelector(selector);
-      if (el) return resolve(el);
-      if (Date.now() - start > timeout) return resolve(null);
-      setTimeout(check, 100);
+    const ok = (el) => !!el && (!predicate || predicate(el));
+
+    const first = document.querySelector(selector);
+    if (ok(first)) return resolve(first);
+
+    let done = false;
+    let obs = null;
+    let timer = null;
+
+    const cleanup = () => {
+      if (obs) obs.disconnect();
+      if (timer) clearTimeout(timer);
+      document.removeEventListener('DOMContentLoaded', onDom, false);
     };
-    check();
+    const finish = (el) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve(el);
+    };
+    const onDom = () => {
+      const el = document.querySelector(selector);
+      if (ok(el)) finish(el);
+    };
+
+    // attributeFilter 只盯 disabled：目标 radio 由 disabled → 可选时也能及时捕获
+    obs = new MutationObserver(() => {
+      const el = document.querySelector(selector);
+      if (ok(el)) finish(el);
+    });
+    obs.observe(document.documentElement || document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['disabled'],
+    });
+    document.addEventListener('DOMContentLoaded', onDom, false);
+
+    timer = setTimeout(() => finish(null), timeout);
   });
 };
 
-// CSP 会拦截 javascript: URL 的导航，content script 隔离世界也访问不到页面的全局函数
-// 通过 background 的 chrome.scripting 在页面主世界 eval 原始代码
-const safeClick = (el) => {
-  if (!el) return false;
+// ---- 主世界数据桥（见 src/content_scripts/bridge.js） ----
+// 隔离世界点击内联 onclick / javascript: 元素会被扩展 CSP 拦，也访问不到页面定义的函数。
+// 旧方案是把代码字符串发给 background 再用 scripting.executeScript 在主世界 eval（三跳）。
+// 桥改为 postMessage 直连 + 结构化数据，省掉 background 往返，也不再需要 eval。
+const BRIDGE_REQ = '__marie_req__';
+const BRIDGE_RES = '__marie_res__';
+const BRIDGE_READY_ATTR = 'data-marie-bridge';
 
-  // 方式1：有 onclick 属性，提取代码在主世界 eval（隔离世界调 onclick 读不到 jQuery 状态）
-  const onclickCode = el.getAttribute('onclick');
-  if (onclickCode) {
-    chrome.runtime.sendMessage({ action: 'EXEC_IN_PAGE', code: onclickCode });
-    return true;
+let bridgeSeq = 0;
+const bridgePending = new Map();
+
+window.addEventListener('message', (ev) => {
+  if (ev.source !== window) return; // 只接受同窗口回包
+  const msg = ev.data;
+  if (!msg || msg.__marie !== BRIDGE_RES) return; // 命名空间校验
+  const settle = bridgePending.get(msg.id);
+  if (!settle) return;
+  bridgePending.delete(msg.id);
+  settle(msg);
+}, false);
+
+const bridgeReady = () => {
+  const root = document.documentElement;
+  return !!(root && root.getAttribute(BRIDGE_READY_ATTR) === '1');
+};
+
+// 桥的就绪标记写在共享 DOM 上，不依赖两条 content_scripts 条目的注入顺序
+const waitBridgeReady = (timeout) => {
+  return new Promise((resolve) => {
+    if (bridgeReady()) return resolve(true);
+
+    let done = false;
+    let obs = null;
+    let timer = null;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      if (obs) obs.disconnect();
+      if (timer) clearTimeout(timer);
+      resolve(v);
+    };
+
+    if (document.documentElement) {
+      obs = new MutationObserver(() => {
+        if (bridgeReady()) finish(true);
+      });
+      obs.observe(document.documentElement, { attributes: true, attributeFilter: [BRIDGE_READY_ATTR] });
+    }
+    timer = setTimeout(() => finish(bridgeReady()), timeout);
+  });
+};
+
+// 桥没随 manifest 注入时（老版本 Chrome 等），让 background 用 scripting 补注一次
+const injectBridgeViaBackground = () => {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ action: 'INJECT_BRIDGE' }, () => resolve());
+  });
+};
+
+const postToBridge = (op, payload, timeout) => {
+  return new Promise((resolve) => {
+    const id = ++bridgeSeq;
+    const timer = setTimeout(() => {
+      bridgePending.delete(id);
+      resolve(null);
+    }, timeout);
+
+    bridgePending.set(id, (msg) => {
+      clearTimeout(timer);
+      resolve(msg);
+    });
+
+    try {
+      window.postMessage({ __marie: BRIDGE_REQ, id: id, op: op, payload: payload }, '*');
+    } catch (e) {
+      clearTimeout(timer);
+      bridgePending.delete(id);
+      resolve(null);
+    }
+  });
+};
+
+// 调用主世界操作。返回 {ok:true,...} / {ok:false,reason} / null（桥完全不可用）
+const callMainWorld = async (op, payload, timeout = 1500) => {
+  let ready = await waitBridgeReady(600);
+  if (!ready) {
+    mark('主世界桥未就绪，补注一次');
+    await injectBridgeViaBackground();
+    ready = await waitBridgeReady(1500);
   }
+  if (!ready) {
+    console.warn('[Marie] 主世界桥不可用，无法执行:', op);
+    return null;
+  }
+  return postToBridge(op, payload, timeout);
+};
 
-  // 方式2：href="javascript:..." 提取代码，交由 background 在主世界 eval
+// 旧路径兜底：把代码字符串交给 background 在主世界 eval
+const execCodeInPage = (code) => {
+  chrome.runtime.sendMessage({ action: 'EXEC_IN_PAGE', code: code });
+};
+
+const extractClickCode = (el) => {
+  if (!el) return null;
+  const onclickCode = el.getAttribute('onclick');
+  if (onclickCode) return onclickCode;
+
   const href = el.getAttribute('href') || '';
   if (href.indexOf('javascript:') === 0) {
     const code = href.slice(11).trim();
-    if (code && code !== 'void(0)') {
-      chrome.runtime.sendMessage({ action: 'EXEC_IN_PAGE', code });
-      return true;
-    }
+    if (code && code !== 'void(0)') return code;
+  }
+  return null;
+};
+
+// 点击元素。优先走主世界桥（无 background 往返）；
+// 桥不可用、或元素只有 href="javascript:..."（主世界触发该导航可能被页面 CSP 拦）时回退旧路径。
+const safeClickSelector = async (selector) => {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+
+  const res = await callMainWorld('click', { sel: selector });
+  if (res && res.ok) return true;
+
+  const code = extractClickCode(el);
+  if (code) {
+    execCodeInPage(code);
+    return true;
   }
 
-  // 方式3：普通元素（input/button 等）直接 click
-  el.click();
-  return true;
+  try {
+    el.click();
+    return true;
+  } catch (e) {
+    return false;
+  }
 };
+
 const sendMessage = chrome.runtime.sendMessage;
 const onMessage = chrome.runtime.onMessage;
 
@@ -147,17 +302,20 @@ const Page = {
   retryCount: 0,
 
   detectSessionTimeout() {
+    // 先做廉价的表单元素探测：只要页面存在预约表单元素，就一定是正常页面，立即早退。
+    // （原顺序是先算 document.body.innerText 强制布局重排、再查表单，白付一次重排开销）
+    var hasForm = !!document.querySelector('#xmnan, #sfzjhmnan, #yyrq, input[name="djjg"], select[name="blcs"], input[name="dxtzf"]');
+    if (hasForm) return false;
+
     // 用 innerText 而不是 textContent：
     // textContent 会把 <script> 标签里的 JS 字符串（如网站自己的 "会话超时" 提示代码）也算进去，造成误判
     // innerText 只包含渲染出来的可见文字
     var text = document.body ? document.body.innerText : '';
     var hasTimeout = text.indexOf('会话超时') >= 0;
-    // 页面上存在预约表单元素，说明是正常页面，绝不判定为超时
-    var hasForm = !!document.querySelector('#xmnan, #sfzjhmnan, #yyrq, input[name="djjg"], select[name="blcs"], input[name="dxtzf"]');
     if (hasTimeout) {
-      console.log('[Marie] 可见文字含"会话超时", hasForm=', hasForm, 'URL=', window.location.href);
+      console.log('[Marie] 可见文字含"会话超时", URL=', window.location.href);
     }
-    return hasTimeout && !hasForm;
+    return hasTimeout;
   },
 
   redirectToHome() {
@@ -178,13 +336,13 @@ const Page = {
   },
 
   autoClickEntryButton() {
-    const button = find('a[href="/wsyy/yyjh.jsp"]');
-    safeClick(button);
+    mark('Page1 点击入口');
+    safeClickSelector('a[href="/wsyy/yyjh.jsp"]');
   },
 
   autoClickNextButton() {
-    const nextButton = find('input[class="btn_1"]');
-    safeClick(nextButton);
+    mark('Page2 点击下一步');
+    safeClickSelector('input[class="btn_1"]');
   },
 
   async autoFillTimeAndBase() {
@@ -192,32 +350,22 @@ const Page = {
     const cityVal = info.address.city;
 
     this.showInfoBar('正在设置日期和城市并查询...');
+    mark('Page3 开始');
 
-    await new Promise((resolve) => {
-      chrome.runtime.sendMessage({
-        action: 'EXEC_IN_PAGE',
-        code: `
-          var d = document.getElementById('yyrq');
-          if (d) {
-            d.value = '${dateVal}';
-            d.setAttribute('value', '${dateVal}');
-          }
-          var s = document.querySelector("select[name='blcs']");
-          if (s) { s.value = '${cityVal}'; }
-          var jq = window.jQuery || window.$;
-          if (jq) {
-            jq('#yyrq').attr('value', '${dateVal}');
-            jq('#yyrq').val('${dateVal}');
-            jq("select[name='blcs']").val('${cityVal}');
-          }
-          var q = document.querySelector('a.querybtn');
-          if (q) {
-            var oc = q.getAttribute('onclick');
-            if (oc) { try { eval(oc); } catch(e) { console.error('query error:', e); } }
-          }
-        `
-      }, () => resolve());
-    });
+    // 等表单渲染出来再设值：否则会静默失败，站点随后自己弹 alert() 冻结页面
+    const dateEl = await waitFor('#yyrq', null, 5000);
+    if (!dateEl) {
+      this.showInfoBar('未找到预约日期输入框(#yyrq)，已停止查询以避免页面弹窗卡死', '#f44336');
+      mark('Page3 中止：未找到 #yyrq');
+      return;
+    }
+
+    const res = await callMainWorld('setDateCity', { date: dateVal, city: cityVal });
+    mark('Page3 设值并触发查询', res ? JSON.stringify(res) : '(桥不可用)');
+
+    if (!res || !res.ok) {
+      this.showInfoBar('设置日期/城市失败：' + (res ? res.reason : '主世界桥不可用，请重新加载扩展'), '#f44336');
+    }
   },
 
   showInfoBar(text, color) {
@@ -239,37 +387,80 @@ const Page = {
     }
   },
 
+  // 等页面把所选网点/时段回显出来（真实站点若没有这些回显元素，则自然等满超时）
+  waitSelectionEcho(timeout) {
+    return new Promise((resolve) => {
+      const check = () => {
+        const o = document.getElementById('selOffice');
+        const t = document.getElementById('selTime');
+        return !!((o && o.textContent.trim()) || (t && t.textContent.trim()));
+      };
+
+      if (check()) return resolve(true);
+
+      let done = false;
+      let obs = null;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        if (obs) obs.disconnect();
+        clearTimeout(timer);
+        resolve(v);
+      };
+
+      const root = document.body || document.documentElement;
+      if (root) {
+        obs = new MutationObserver(() => {
+          if (check()) finish(true);
+        });
+        obs.observe(root, { childList: true, subtree: true, characterData: true });
+      }
+      const timer = setTimeout(() => finish(false), timeout);
+    });
+  },
+
+  // 点「下一步」前的确认等待：先等页面回显所选网点/时段（通常 <200ms），
+  // 最多等到 confirmDelay（可配置），并保证至少 settle 200ms 给站点自己的事件处理留时间。
+  async waitConfirmReady() {
+    const delay = Math.max(200, info.confirmDelay || 1000);
+    const minSettle = 200;
+    const started = Date.now();
+
+    const echoed = await Promise.race([
+      this.waitSelectionEcho(delay),
+      sleep(delay).then(() => false),
+    ]);
+
+    const elapsed = Date.now() - started;
+    if (elapsed < minSettle) await sleep(minSettle - elapsed);
+
+    mark('Page5 确认等待结束', 'echo=' + echoed + ' 用时 ' + (Date.now() - started) + 'ms');
+  },
+
   async autoFillOfficeAndTime() {
-    await waitForElement('input[type="radio"][name="djjg"]', 10000);
-    await new Promise(r => setTimeout(r, 500));
+    mark('Page5 开始');
+    await waitFor('input[type="radio"][name="djjg"]', null, 10000);
+    mark('Page5 网点列表就绪');
 
     const officeList = info.address.officeList;
-    let selectedOffice = false;
-    let selectedOfficeName = '';
     let selectedOfficeCode = '';
+    let selectedOfficeName = '';
 
+    // 配置的网点按优先级取第一个可用
     for (let i = 0; i < officeList.length; i++) {
-      const officeEditor = find(`input[type="radio"][name="djjg"][value="${officeList[i]}"]`);
-      if (officeEditor && !officeEditor.disabled) {
-        selectedOffice = true;
+      const el = find(`input[type="radio"][name="djjg"][value="${officeList[i]}"]`);
+      if (el && !el.disabled) {
         selectedOfficeCode = officeList[i];
-        var nameTd = find(`td[id="${officeList[i]}"]`);
-        selectedOfficeName = nameTd ? nameTd.textContent.trim() : officeList[i];
         break;
       }
     }
 
-    if (!selectedOffice) {
+    if (!selectedOfficeCode) {
       const fallback = find('input[type="radio"][name="djjg"]:not([disabled])');
-      if (fallback) {
-        selectedOffice = true;
-        selectedOfficeCode = fallback.value;
-        var nameTd = find(`td[id="${fallback.value}"]`);
-        selectedOfficeName = nameTd ? nameTd.textContent.trim() : fallback.value;
-      }
+      if (fallback) selectedOfficeCode = fallback.value;
     }
 
-    if (!selectedOffice) {
+    if (!selectedOfficeCode) {
       this.showStatusBar(false, '', false, '');
       if (info.retry.enabled && this.retryCount < info.retry.maxAttempts) {
         this.retryCount++;
@@ -278,84 +469,88 @@ const Page = {
       return;
     }
 
-    // 在主世界点击 radio 并触发 jQuery 事件，确保 AJAX 时间段加载
-    await new Promise((resolve) => {
-      chrome.runtime.sendMessage({
-        action: 'EXEC_IN_PAGE',
-        code: `
-          var r = document.querySelector('input[type="radio"][name="djjg"][value="${selectedOfficeCode}"]');
-          if (r) {
-            r.checked = true;
-            r.click();
-            var jq = window.jQuery || window.$;
-            if (jq) { jq(r).trigger('change'); jq(r).trigger('click'); }
-          }
-        `
-      }, () => resolve());
-    });
+    const nameTd = find(`td[id="${selectedOfficeCode}"]`);
+    selectedOfficeName = nameTd ? nameTd.textContent.trim() : selectedOfficeCode;
+
+    const officeRes = await callMainWorld('selectRadio', { name: 'djjg', value: selectedOfficeCode });
+    mark('Page5 网点已选', selectedOfficeName + ' ' + (officeRes ? JSON.stringify(officeRes) : '(桥不可用)'));
+
+    if (!officeRes || !officeRes.ok) {
+      this.showInfoBar('选中网点失败：' + (officeRes ? officeRes.reason : '主世界桥不可用，请重新加载扩展'), '#f44336');
+      return;
+    }
 
     this.showInfoBar('已选网点: ' + selectedOfficeName + '，等待时间段加载...');
 
-    // 选了网点后，时间段是 AJAX 动态加载的，需要等待
-    await waitForElement('input[type="radio"][name="yysj"]', 15000);
-    await new Promise(r => setTimeout(r, 800));
-
+    // 时段是选网点后 AJAX 动态加载的。
+    // 原来做法是「等任意时段出现 + 固定睡 800ms」，既慢又可能在目标时段渲染出来前退化成 fallback；
+    // 现在改为直接等「配置里的目标时段」出现且可选。
     const timeList = info.address.timeList;
-    let selectedTime = false;
-    let selectedTimeValue = '';
-    let selectedTimeCode = '';
+    let targetTime = '';
 
     for (let i = 0; i < timeList.length; i++) {
-      const timeEditor = find(`input[type="radio"][name="yysj"][value="${timeList[i]}"]`);
-      if (timeEditor && !timeEditor.disabled) {
-        selectedTime = true;
-        selectedTimeValue = timeList[i];
-        selectedTimeCode = timeList[i];
+      const el = find(`input[type="radio"][name="yysj"][value="${timeList[i]}"]`);
+      if (el && !el.disabled) {
+        targetTime = timeList[i];
         break;
       }
     }
 
-    if (!selectedTime) {
-      const fallback = find('input[type="radio"][name="yysj"]:not([disabled])');
-      if (fallback) {
-        selectedTime = true;
-        selectedTimeValue = fallback.value;
-        selectedTimeCode = fallback.value;
+    if (!targetTime && timeList.length) {
+      await waitFor(
+        `input[type="radio"][name="yysj"][value="${timeList[0]}"]`,
+        (el) => !el.disabled,
+        15000
+      );
+      mark('Page5 目标时段出现');
+      for (let i = 0; i < timeList.length; i++) {
+        const el = find(`input[type="radio"][name="yysj"][value="${timeList[i]}"]`);
+        if (el && !el.disabled) {
+          targetTime = timeList[i];
+          break;
+        }
       }
     }
 
-    // 在主世界点击时间 radio
-    if (selectedTimeCode) {
-      await new Promise((resolve) => {
-        chrome.runtime.sendMessage({
-          action: 'EXEC_IN_PAGE',
-          code: `
-            var r = document.querySelector('input[type="radio"][name="yysj"][value="${selectedTimeCode}"]');
-            if (r) {
-              r.checked = true;
-              r.click();
-              var jq = window.jQuery || window.$;
-              if (jq) { jq(r).trigger('change'); jq(r).trigger('click'); }
-            }
-          `
-        }, () => resolve());
-      });
+    if (!targetTime) {
+      // 配置的时段都没渲染出来 → 退化到第一个可用时段
+      const fallback = find('input[type="radio"][name="yysj"]:not([disabled])');
+      if (fallback) targetTime = fallback.value;
     }
 
-    this.showStatusBar(selectedOffice, selectedOfficeName, selectedTime, selectedTimeValue);
+    let selectedTime = false;
+    if (targetTime) {
+      const timeRes = await callMainWorld('selectRadio', { name: 'yysj', value: targetTime });
+      selectedTime = !!(timeRes && timeRes.ok && timeRes.checked);
+      mark('Page5 时段已选', targetTime + ' ' + (timeRes ? JSON.stringify(timeRes) : '(桥不可用)'));
+    }
 
-    if (selectedOffice && selectedTime) {
+    this.showStatusBar(true, selectedOfficeName, selectedTime, targetTime);
+
+    if (selectedTime) {
       chrome.storage.sync.set({
         marieLastSelect: {
           office: selectedOfficeName,
-          time: selectedTimeValue,
+          time: targetTime,
           date: info.address.date,
           ts: Date.now(),
         }
       });
-      await new Promise(r => setTimeout(r, 3000));
-      const nextButton = find('input[class="btn_1"]');
-      safeClick(nextButton);
+
+      await this.waitConfirmReady();
+
+      // 点「下一步」前断言两个 radio 都已登记选中：
+      // 否则站点会自己弹 alert("请选择办理网点/时间段") 冻结页面
+      const officeChecked = find('input[name="djjg"]:checked');
+      const timeChecked = find('input[name="yysj"]:checked');
+      if (!officeChecked || !timeChecked) {
+        this.showInfoBar('网点/时段未登记选中，已跳过点击「下一步」', '#f44336');
+        mark('Page5 中止：未登记选中');
+        return;
+      }
+
+      mark('Page5 点击下一步');
+      await safeClickSelector('input[class="btn_1"]');
       return;
     }
 
@@ -439,104 +634,73 @@ const Page = {
     }
 
     this.showInfoBar('正在填写双方信息...');
-    // 等真实页面框架完成初始化再设值
-    await new Promise(r => setTimeout(r, 500));
+    mark('Page4 开始填表');
+
+    // 等表单渲染出来再填（原来是固定 sleep 500ms）
+    const formEl = await waitFor('#xmnan', null, 5000);
+    if (!formEl) {
+      this.showInfoBar('未找到双方信息表单(#xmnan)，已停止填写', '#f44336');
+      mark('Page4 中止：未找到表单');
+      return;
+    }
+    mark('Page4 表单就绪');
 
     var notifyValue = info.notifyValue;
     var hasPhone = !!(m.phone.value || f.phone.value);
 
-    // 在主世界逐字段设值，每个字段独立 try/catch，并把 成功/失败/缺失 结果写回页面顶部状态栏
-    await new Promise((resolve) => {
-      chrome.runtime.sendMessage({
-        action: 'EXEC_IN_PAGE',
-        code: `
-          (function(){
-            var filled = [], failed = [], missing = [];
-            var jq = window.jQuery || window.$;
-            var fields = [
-              {sel: '#xmnan', val: '${m.name.value}', label: '男方姓名'},
-              {sel: '#sfzjhmnan', val: '${m.id.value}', label: '男方证件号'},
-              {sel: '#whcdnan', val: '${m.degree.value}', label: '男方文化程度'},
-              {sel: '#zynan', val: '${m.job.value}', label: '男方职业'},
-              {sel: '#lxdhnan', val: '${m.phone.value}', label: '男方手机号'},
-              {sel: '#xmnv', val: '${f.name.value}', label: '女方姓名'},
-              {sel: '#sfzjhmnv', val: '${f.id.value}', label: '女方证件号'},
-              {sel: '#whcdnv', val: '${f.degree.value}', label: '女方文化程度'},
-              {sel: '#zynv', val: '${f.job.value}', label: '女方职业'},
-              {sel: '#lxdhnv', val: '${f.phone.value}', label: '女方手机号'},
-            ];
-            for (var i = 0; i < fields.length; i++) {
-              var item = fields[i];
-              try {
-                var el = document.querySelector(item.sel);
-                if (!el) { missing.push(item.label); continue; }
-                el.value = item.val;
-                // select 下拉框若选项值不匹配，el.value 会设不进去
-                if (el.value !== item.val && jq) {
-                  try { jq(el).val(item.val); } catch(e) {}
-                }
-                if (el.value !== item.val) { failed.push(item.label); continue; }
-                if (jq) {
-                  try { jq(el).trigger('change'); } catch(e) {}
-                  // 仅对有值的字段触发 blur，避免空值校验弹窗
-                  if (item.val) { try { jq(el).trigger('blur'); } catch(e) {} }
-                }
-                filled.push(item.label);
-              } catch (e) {
-                failed.push(item.label);
-              }
-            }
-            var notifyOk = false;
-            try {
-              var r = document.querySelector('input[name="dxtzf"][value="${notifyValue}"]');
-              if (r) {
-                r.checked = true;
-                r.click();
-                if (jq) { try { jq(r).trigger('change'); } catch(e) {} }
-                notifyOk = r.checked;
-              } else {
-                missing.push('通知方式');
-              }
-            } catch(e) { failed.push('通知方式'); }
+    // 结构化传参（不再把用户配置插值进代码字符串，消除引号注入/语法错误隐患）
+    var fields = [
+      { sel: '#xmnan', val: m.name.value, label: '男方姓名' },
+      { sel: '#sfzjhmnan', val: m.id.value, label: '男方证件号' },
+      { sel: '#whcdnan', val: m.degree.value, label: '男方文化程度' },
+      { sel: '#zynan', val: m.job.value, label: '男方职业' },
+      { sel: '#lxdhnan', val: m.phone.value, label: '男方手机号' },
+      { sel: '#xmnv', val: f.name.value, label: '女方姓名' },
+      { sel: '#sfzjhmnv', val: f.id.value, label: '女方证件号' },
+      { sel: '#whcdnv', val: f.degree.value, label: '女方文化程度' },
+      { sel: '#zynv', val: f.job.value, label: '女方职业' },
+      { sel: '#lxdhnv', val: f.phone.value, label: '女方手机号' },
+    ];
 
-            var okAll = missing.length === 0 && failed.length === 0;
-            try {
-              var old = document.getElementById('marie-status');
-              if (old) old.remove();
-              var bar = document.createElement('div');
-              bar.id = 'marie-status';
-              bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;padding:8px 16px;font-size:13px;color:#fff;background:' + (okAll ? '#4CAF50' : '#FF9800') + ';';
-              bar.textContent = 'Marie | 已填 ' + filled.length + '/10' +
-                (failed.length ? ' | 设置失败: ' + failed.join('、') : '') +
-                (missing.length ? ' | 未找到: ' + missing.join('、') : '') +
-                ' | 通知方式: ' + (notifyOk ? '已选' : '未选');
-              document.body.appendChild(bar);
-            } catch(e) {}
-            console.log('[Marie page4] filled=', filled, 'failed=', failed, 'missing=', missing, 'notifyOk=', notifyOk);
-          })();
-        `
-      }, () => resolve());
-    });
+    var res = await callMainWorld('fillFields', { fields: fields, notifyValue: notifyValue });
+    mark('Page4 填表完成', res ? ('已填 ' + res.filled.length + '/10') : '(桥不可用)');
+
+    if (!res || !res.ok) {
+      this.showInfoBar('填写失败：' + (res ? res.reason : '主世界桥不可用，请重新加载扩展'), '#f44336');
+      return;
+    }
+
+    // 结果状态栏改在隔离世界渲染（DOM 两世界共享），省掉一次主世界往返
+    var okAll = res.missing.length === 0 && res.failed.length === 0;
+    this.showInfoBar(
+      '已填 ' + res.filled.length + '/10' +
+      (res.failed.length ? ' | 设置失败: ' + res.failed.join('、') : '') +
+      (res.missing.length ? ' | 未找到: ' + res.missing.join('、') : '') +
+      ' | 通知方式: ' + (res.notifyOk ? '已选' : '未选'),
+      okAll ? '#4CAF50' : '#FF9800'
+    );
 
     // 获取验证码：仅在配置了手机号时才点，避免真实页面弹"请输入手机号"卡住
-    setTimeout(() => {
-      if (!hasPhone) {
-        this.appendInfoBar('未配置手机号，未自动点击"获取验证码"');
-        return;
-      }
-      const getCodeButton = find('#sms_get');
-      if (getCodeButton) {
-        safeClick(getCodeButton);
-      } else {
-        this.appendInfoBar('未找到获取验证码按钮(#sms_get)');
-      }
-    }, 800);
+    if (!hasPhone) {
+      this.appendInfoBar('未配置手机号，未自动点击"获取验证码"');
+      return;
+    }
+
+    // 原来是固定 setTimeout 800ms，改为等按钮出现就点
+    const smsBtn = await waitFor('#sms_get', null, 3000);
+    if (smsBtn) {
+      await safeClickSelector('#sms_get');
+      mark('Page4 已点获取验证码');
+    } else {
+      this.appendInfoBar('未找到获取验证码按钮(#sms_get)');
+    }
   },
 
   bindEvent: function() {
     const that = this;
     const onPageLoad = () => {
       document.documentElement.setAttribute('data-marie', 'loaded');
+      mark('load 事件');
       console.log('[Marie] 页面加载完成, URL=', window.location.href);
       var isTimeout = false;
       try {
@@ -568,7 +732,7 @@ const Page = {
 
     onMessage.addListener(function(req, sender, sendResponse) {
       const { action } = req;
-      console.log('[Marie] 收到消息:', action);
+      mark('收到消息', action);
       if (action === 'FILL_PAGE_1') {
         sendResponse('ok');
         that.autoClickEntryButton();
@@ -594,6 +758,7 @@ const Page = {
   init: function() {
     // 跨世界可见的注入标记（模拟站诊断角标用）
     document.documentElement.setAttribute('data-marie', 'injected');
+    mark('content script 注入');
     this.bindEvent();
   },
 };

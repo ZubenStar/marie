@@ -19,7 +19,7 @@ Marie 是一个用来让「广东省结婚预约流程」更快的 Chrome 浏览
 | Page 1 | 首页（`main.jsp` / `index.jsp`） | 自动点击进入「婚姻登记预约流程」 |
 | Page 2 | `yyjh.jsp` | 自动点击「下一步」 |
 | Page 3 | `yyjh.do?do=nextOper` | 自动填写预约日期和办理城市，执行查询 |
-| Page 4 | `common.do?do=getWdrqxx` | 等待网点列表 AJAX 渲染，按优先级选网点和时段，确认 3 秒后点击下一步 |
+| Page 4 | `common.do?do=getWdrqxx` | 等待网点列表 AJAX 渲染，按优先级选网点和时段，等页面回显所选网点/时段后点击下一步（确认延时默认 1 秒，可在 Popup 中调整） |
 | Page 5 | `yyjh.do?do=preYyxxOper` | 自动填写双方个人信息、选通知方式、点获取验证码（带填写结果诊断） |
 
 > 注意：代码内部的消息编号与表格顺序不完全一致——`FILL_PAGE_4` 对应表格 Page 5（填双方信息），`FILL_PAGE_5` 对应表格 Page 4（选网点）。
@@ -35,7 +35,7 @@ Marie 是一个用来让「广东省结婚预约流程」更快的 Chrome 浏览
 
 | 改的文件 | 刷新方式 |
 |---------|---------|
-| `marriage.js` / `background.js` / `manifest.json` | `chrome://extensions` 点 Marie 卡片的刷新按钮，然后刷新预约网页 |
+| `marriage.js` / `bridge.js` / `background.js` / `manifest.json` | `chrome://extensions` 点 Marie 卡片的刷新按钮，然后刷新预约网页 |
 | `popup.html` / `popup.js` / `popup.css` | 关闭弹窗重新打开即可 |
 
 ## 使用方法
@@ -49,6 +49,7 @@ Marie 是一个用来让「广东省结婚预约流程」更快的 Chrome 浏览
 - **网点代码**：逗号分隔，如 `4403040A1000`（福田区）
 - **时间段**：逗号分隔，按优先级排序
 - **双方信息**：姓名、身份证号、文化程度、职业、手机号
+- **确认延时**：点「下一步」前的最长等待毫秒数，默认 `1000`
 - **重试设置**：间隔(ms) 和最大次数
 
 点「保存配置」即可，配置通过 `chrome.storage.sync` 持久化，不需要改代码。
@@ -139,7 +140,8 @@ marie/
 │   └── background.js          # Service Worker，页面路由 + 主世界代码执行
 ├── src/
 │   ├── content_scripts/
-│   │   └── marriage.js        # Content Script，页面自动化逻辑
+│   │   ├── bridge.js          # 主世界数据桥（world: MAIN），postMessage 直连，替代 background 三跳
+│   │   └── marriage.js        # Content Script（隔离世界），页面自动化逻辑
 │   ├── css/
 │   │   └── popup.css          # 弹窗样式
 │   └── js/
@@ -151,19 +153,49 @@ marie/
 
 ## 技术要点
 
-### CSP 绕过
+### 主世界数据桥
 
-广东省民政局网站有 CSP 限制，`<a href="javascript:...">` 的 `.click()` 会触发 CSP 拦截。同时 content script 运行在隔离世界，`window[fnName]` 访问不到页面定义的函数。
+广东省民政局网站有 CSP 限制，从隔离世界点击内联 `onclick` / `<a href="javascript:...">` 元素会被扩展 CSP 拦截；同时 content script 运行在隔离世界，访问不到页面定义的函数（如 `changeWdrqxx`）。
 
-解决方案：`safeClick` 提取 `javascript:` 后的代码，通过 `chrome.runtime.sendMessage` 发给 background，background 用 `chrome.scripting.executeScript({ world: 'MAIN' })` 在页面的主世界 `eval` 执行。
+解决方案是 `src/content_scripts/bridge.js`——以 `"world": "MAIN"` 声明的第二条 content script，与隔离世界通过 `window.postMessage` 直连：
+
+- 桥**只接收结构化数据**（`click` / `setDateCity` / `selectRadio` / `fillFields`），不使用 `eval`，因此既不依赖页面 `unsafe-eval`，也消除了把用户配置插值进代码字符串的引号注入隐患。
+- 消息带 `__marie` 命名空间与自增 `id` 关联请求/响应，并校验 `event.source === window`，防止页面脚本伪造消息。
+- 就绪信号写在共享 DOM 上（`data-marie-bridge`），因此不依赖两条 content script 的注入顺序。
+- 桥内 `window.jQuery` 每次调用时惰性获取——`document_start` 时页面的 jQuery 尚未加载。
+- 少数「只有 `href="javascript:..."` 且无 `onclick`」的元素，主世界触发该导航仍可能被页面 CSP 拦，桥会返回 `needsFallback`，自动回退到 background 的 `EXEC_IN_PAGE` 路径。
+
+相比原来的「内容脚本 → Service Worker → `chrome.scripting.executeScript` → 主世界 eval」三跳，`postMessage` 直连省掉了 Service Worker 冷启动开销（可达 100ms+）。桥未注入时（如旧版 Chrome），`callMainWorld` 会通过 `INJECT_BRIDGE` 让 background 补注一次。
 
 ### jQuery 读值兼容
 
-Page 3 的查询函数用 `jQuery('#yyrq').attr('value')` 读日期（读的是 HTML 属性而非 DOM 属性），只设置 `.value` 会读到空值。解决方案是在主世界三重设值：`setAttribute('value', ...)` + `jQuery().attr()` + `jQuery().val()`，然后再 `eval` 查询按钮的代码。
+Page 3 的查询函数用 `jQuery('#yyrq').attr('value')` 读日期（读的是 HTML 属性而非 DOM 属性），只设置 `.value` 会读到空值。解决方案是在主世界三重设值：`setAttribute('value', ...)` + `jQuery().attr()` + `jQuery().val()`，然后再触发查询按钮。
 
-### 异步 radio 渲染
+### 异步渲染与条件等待
 
-Page 4 中选中网点后，时间段列表是 AJAX 动态加载的，`waitForElement` 轮询等待 radio 出现（最长 15 秒）后再操作。
+原来用固定 `setTimeout` 兜底（选网点页 500 + 800 + 3000ms，填表页 500 + 800ms，合计约 5.6 秒与页面实际速度无关），并靠 100ms 轮询检测元素。
+
+现在改为：
+
+- `waitFor(selector, predicate, timeout)`：基于 `MutationObserver` 做亚帧级检测，支持「存在且未 disabled」这类谓词。
+- 时段等待直接盯**配置里的目标时段**（`input[name=yysj][value="..."]:not([disabled])`）出现，而不是「任意时段出现后再睡 800ms」——既更快，也避免在目标时段渲染出来之前退化成 fallback。
+- 点「下一步」前不再固定等 3 秒，改为「等页面回显所选网点/时段，最多等 `confirmDelay`（默认 1000ms）」+ 最小 settle 200ms，并且**点击前断言** `djjg:checked` 与 `yysj:checked` 都存在，避免站点自弹 `alert()` 冻结页面。
+- Page 3 设值前先 `waitFor('#yyrq')`，元素没渲染出来就报错停手，不再静默失败后触发站点弹窗。
+- 各阶段打 `[Marie][t]` 计时日志，控制台按该前缀过滤即可看到每步耗时。
+
+### 实测提速
+
+用 jsdom 加载本地模拟站页面、并在同一套 `chrome` API 桩下分别运行优化前后的代码，逐页面计时：
+
+| 阶段 | 优化前 | 优化后 | 变化 |
+|------|-------|-------|------|
+| Page 3 日期/城市设值 + 查询 | 105 ms | 67 ms | −36% |
+| Page 5 选网点 + 选时段 + 确认 + 下一步 | 5063 ms | 894 ms | −82% |
+| Page 4 填双方信息 + 通知方式 + 获取验证码 | 1423 ms | 107 ms | −92% |
+| **合计** | **6591 ms** | **1068 ms** | **−84%** |
+| background `EXEC_IN_PAGE` 三跳次数 | 6 | 0 | 全部消除 |
+
+> 数据来自本地模拟站（时间段 AJAX 固定 600ms），真实站点耗时取决于接口响应速度，但固定等待与三跳往返的消除是可迁移的。
 
 ### 竞态修复
 
@@ -171,7 +203,7 @@ Page 4 中选中网点后，时间段列表是 AJAX 动态加载的，`waitForEl
 
 ### 会话超时检测
 
-页面加载时检查 `document.body.innerText` 是否包含"会话超时"——用 `innerText` 而非 `textContent`，避免 `<script>` 标签内的"会话超时"字符串造成误判；同时检查页面是否存在预约表单元素（`#xmnan`、`#yyrq` 等），两个条件同时满足（可见文字含超时且无表单元素）才判定为超时。检测到后显示红色信息栏，2 秒后发 `REDIRECT_HOME` 消息给 background，background 用 `chrome.tabs.update` 跳转首页，首页加载后自动从 Page 1 重新开始。
+页面加载时先做一次廉价的表单元素探测（`#xmnan`、`#yyrq`、`input[name="djjg"]` 等），只要存在就立即判定为正常页面并返回，不做后续计算；确认没有表单元素后，再检查 `document.body.innerText` 是否包含"会话超时"——用 `innerText` 而非 `textContent`，避免 `<script>` 标签内的"会话超时"字符串造成误判。两个条件同时满足才判定为超时。检测到后显示红色信息栏，2 秒后发 `REDIRECT_HOME` 消息给 background，background 用 `chrome.tabs.update` 跳转首页，首页加载后自动从 Page 1 重新开始。
 
 ## 注意事项
 

@@ -3,6 +3,7 @@
 	"name": "Marie",
 	"version": "2.0.0",
 	"description": "广东省结婚登记预约小帮手",
+	"minimum_chrome_version": "111",
 	"icons": {
 		"19": "images/logo.png",
 		"38": "images/logo.png",
@@ -15,6 +16,11 @@
 	},
 
 	"content_scripts": [{
+		"matches": ["*://www.gdhy.gov.cn/*", "http://localhost/*"],
+		"js": ["./src/content_scripts/bridge.js"],
+		"run_at": "document_start",
+		"world": "MAIN"
+	}, {
 		"matches": ["*://www.gdhy.gov.cn/*", "http://localhost/*"],
 		"js": ["./src/content_scripts/marriage.js"],
 		"run_at": "document_start"
