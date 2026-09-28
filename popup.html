@@ -7,20 +7,79 @@
 	<body>
 		<div class="container" id="container">
 
-			<div class="button-area">
+			<div class="tab-bar">
+				<button class="tab-btn active" data-tab="config">配置</button>
+				<button class="tab-btn" data-tab="action">操作</button>
+			</div>
 
-				<div class="button-row">
-					<button class="account-btn" id="firstPageButton">基本信息</button>
+			<div class="switch-row">
+				<label class="switch-label">插件开关</label>
+				<label class="switch">
+					<input type="checkbox" id="cfg-enabled">
+					<span class="slider"></span>
+				</label>
+			</div>
+
+			<!-- 配置面板 -->
+			<div class="tab-panel active" id="tab-config">
+				<div class="section">
+					<div class="section-title">预约日期 & 城市</div>
+					<label>预约日期<input type="date" id="cfg-date"></label>
+					<label>办理城市代码<input type="text" id="cfg-city" placeholder="440300000000"></label>
+					<label>网点代码（逗号分隔）<input type="text" id="cfg-offices" placeholder="4403040A1000"></label>
+					<label>时间段（逗号分隔，按优先级）<input type="text" id="cfg-times" placeholder="9:00-10:00,10:00-11:00"></label>
+				</div>
+
+				<div class="section">
+					<div class="section-title">男方信息</div>
+					<label>姓名<input type="text" id="cfg-m-name"></label>
+					<label>身份证号<input type="text" id="cfg-m-id"></label>
+					<label>文化程度<input type="text" id="cfg-m-degree"></label>
+					<label>职业<input type="text" id="cfg-m-job"></label>
+					<label>手机号<input type="text" id="cfg-m-phone"></label>
+				</div>
+
+				<div class="section">
+					<div class="section-title">女方信息</div>
+					<label>姓名<input type="text" id="cfg-f-name"></label>
+					<label>身份证号<input type="text" id="cfg-f-id"></label>
+					<label>文化程度<input type="text" id="cfg-f-degree"></label>
+					<label>职业<input type="text" id="cfg-f-job"></label>
+					<label>手机号<input type="text" id="cfg-f-phone"></label>
+				</div>
+
+				<div class="section">
+					<div class="section-title">重试设置</div>
+					<label>重试间隔(ms)<input type="number" id="cfg-retry-interval"></label>
+					<label>最大重试次数<input type="number" id="cfg-retry-max"></label>
 				</div>
 
 				<div class="button-row">
-					<button class="account-btn" id="secondPageButton">人员信息</button>
+					<button class="account-btn save-btn" id="saveButton">保存配置</button>
+				</div>
+			</div>
+
+			<!-- 操作面板 -->
+			<div class="tab-panel" id="tab-action">
+				<div class="button-area">
+					<div class="button-row">
+						<button class="account-btn save-btn" id="startHomeButton">从首页开始</button>
+					</div>
+					<div class="button-row">
+						<button class="account-btn" id="localTestButton">本地模拟测试</button>
+					</div>
+					<div class="button-row">
+						<button class="account-btn" id="firstPageButton">基本信息</button>
+					</div>
+					<div class="button-row">
+						<button class="account-btn" id="secondPageButton">人员信息</button>
+					</div>
 				</div>
 			</div>
 
 			<div class="footer">Powered by kyrieliu</div>
 		</div>
-	</body>
 
-	<script src="./src/js/popup.js"></script>
+		<script src="./src/js/popup.js"></script>
+	</body>
 </html>

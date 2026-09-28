@@ -3,45 +3,35 @@ let currentPageInfo = null; // 存储当前页面信息
 
 // 根据页面URL判断并执行相应的自动化操作
 function handlePageAction(tabId, url) {
-	console.log('处理页面自动化操作，URL:', url);
-	
 	let action = null;
-	let delay = 0;
-	
-	if (url.indexOf('main.jsp') > 0) {
-		// 首页
+
+	// 去掉 query string 和 hash
+	var path = url.split('?')[0].split('#')[0];
+
+	if (path === 'http://www.gdhy.gov.cn' || path === 'http://www.gdhy.gov.cn/' ||
+	    path === 'https://www.gdhy.gov.cn' || path === 'https://www.gdhy.gov.cn/' ||
+	    path === 'http://www.gdhy.gov.cn/index.jsp' || path === 'https://www.gdhy.gov.cn/index.jsp' ||
+	    path === 'http://www.gdhy.gov.cn/wsyy/index.jsp' || path === 'https://www.gdhy.gov.cn/wsyy/index.jsp' ||
+	    path === 'http://localhost:8899' || path === 'http://localhost:8899/' ||
+	    path.indexOf('main.jsp') > 0) {
 		action = 'FILL_PAGE_1';
-	} else if (url.indexOf('yyjh.jsp') > 0) {
-		// 双方基本信息页面
+	} else if (path.indexOf('yyjh.jsp') > 0) {
 		action = 'FILL_PAGE_2';
-		delay = 100;
 	} else if (url.indexOf('yyjh.do?do=nextOper') > 0) {
-		// 选择预约民政局及日期页
 		action = 'FILL_PAGE_3';
 	} else if (url.indexOf('yyjh.do?do=preYyxxOper') > 0) {
-		// 双方信息页，这里不主动触发
 		action = 'FILL_PAGE_4';
 	} else if (url.indexOf('common.do?do=getWdrqxx') > 0) {
-		// 选择办理网点及时间
 		action = 'FILL_PAGE_5';
 	}
 	
+	console.log('[Marie bg] 路由结果:', action, 'URL=', url);
 	if (action) {
-		const executeAction = () => {
-			chrome.tabs.sendMessage(tabId, { action }, (response) => {
-				if (chrome.runtime.lastError) {
-					console.log('发送消息失败:', chrome.runtime.lastError.message);
-				} else {
-					console.log('自动化操作响应:', response);
-				}
-			});
-		};
-		
-		if (delay > 0) {
-			setTimeout(executeAction, delay);
-		} else {
-			executeAction();
-		}
+		chrome.tabs.sendMessage(tabId, { action }, (response) => {
+			if (chrome.runtime.lastError) {
+				console.error('[Marie bg] 发送失败:', chrome.runtime.lastError.message);
+			}
+		});
 	}
 }
 
@@ -58,10 +48,15 @@ onMessage.addListener(function(req, sender, sendResponse){
 				timestamp: Date.now()
 			};
 
-			// 直接在background中处理页面自动化逻辑
-			handlePageAction(sender.tab.id, sender.tab.url);
-			
-			sendResponse('页面加载信息已记录并处理');
+			// 检查插件开关，开启时才自动执行
+			chrome.storage.sync.get({ marieEnabled: false }, (data) => {
+				console.log('[Marie bg] PAGE_LOAD, 开关=', data.marieEnabled, 'URL=', sender.tab.url);
+				if (data.marieEnabled) {
+					handlePageAction(sender.tab.id, sender.tab.url);
+				}
+			});
+
+			sendResponse('ok');
 			break;
 		case 'GET_CURRENT_PAGE_INFO':
 			// popup可以请求当前页面信息
@@ -71,12 +66,32 @@ onMessage.addListener(function(req, sender, sendResponse){
 			// 处理来自popup的手动填充请求
 			chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
 				if (tabs[0]) {
-					chrome.tabs.sendMessage(tabs[0].id, { action: req.fillAction }, (response) => {
-						console.log('手动填充响应:', response);
-					});
+					chrome.tabs.sendMessage(tabs[0].id, { action: req.fillAction }, (response) => {});
 				}
 			});
 			sendResponse('手动填充指令已发送');
+			break;
+		case 'EXEC_IN_PAGE':
+			chrome.scripting.executeScript({
+				target: { tabId: sender.tab.id },
+				world: 'MAIN',
+				func: function(code) {
+					try { (0, eval)(code); } catch(e) { console.error('EXEC_IN_PAGE error:', e); }
+				},
+				args: [req.code]
+			}).then(() => {
+				sendResponse('ok');
+			}).catch(function(err) {
+				sendResponse('error: ' + err.message);
+			});
+			return true;
+		case 'REDIRECT_HOME':
+			// 本地测试时跳回本地首页，真实环境跳回官网首页
+			var homeUrl = (sender.tab.url && sender.tab.url.indexOf('localhost') >= 0)
+				? 'http://localhost:8899/'
+				: 'http://www.gdhy.gov.cn';
+			chrome.tabs.update(sender.tab.id, { url: homeUrl });
+			sendResponse('ok');
 			break;
 		default:
 			return;

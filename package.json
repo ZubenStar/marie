@@ -2,9 +2,8 @@
   "name": "marie",
   "version": "2.0.0",
   "description": "A chrome extension for marriage reservation in Guangdong China",
-  "main": "popup.js",
   "scripts": {
-    "test": ""
+    "mock": "node test/server.js"
   },
   "repository": {
     "type": "git",
